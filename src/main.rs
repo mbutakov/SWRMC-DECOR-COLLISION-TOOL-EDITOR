@@ -190,6 +190,10 @@ struct CollisionEditorApp {
     texture_path: Option<PathBuf>,
     loaded_texture: Option<RgbaImage>,
     preview_texture: Option<egui::TextureHandle>,
+    /// Source images keyed by Blockbench texture slot (e.g. `0`, `metal`).
+    texture_sources: HashMap<String, PathBuf>,
+    atlas_regions: HashMap<String, [f32; 4]>,
+    texture_dimensions: HashMap<String, [f32; 2]>,
 
     camera: Camera,
     show_model_faces: bool,
@@ -206,8 +210,20 @@ struct CollisionEditorApp {
     target_box_count: usize,
     min_detail_size: f32,
     approximation_fill: f32,
-    undo_history: UndoHistory<CollisionData>,
+    undo_history: UndoHistory<UndoAction>,
     gizmo_drag: Option<(usize, Vec3, [f32; 3])>,
+}
+
+#[derive(Clone)]
+struct TextureState {
+    sources: HashMap<String, PathBuf>,
+    texture_path: Option<PathBuf>,
+    model_textures: Option<HashMap<String, serde_json::Value>>,
+}
+
+enum UndoAction {
+    Collision(CollisionData),
+    Textures(TextureState),
 }
 
 impl Default for CollisionEditorApp {
@@ -231,6 +247,9 @@ impl Default for CollisionEditorApp {
             texture_path: None,
             loaded_texture: None,
             preview_texture: None,
+            texture_sources: HashMap::new(),
+            atlas_regions: HashMap::new(),
+            texture_dimensions: HashMap::new(),
             camera: Camera::default(),
             show_model_faces: true,
             show_model_wire: true,
@@ -252,15 +271,54 @@ impl Default for CollisionEditorApp {
 
 impl CollisionEditorApp {
     fn save_undo_point(&mut self) {
-        self.undo_history.push(self.collision.clone());
+        self.undo_history
+            .push(UndoAction::Collision(self.collision.clone()));
     }
 
     fn undo_collision_edit(&mut self) {
         if let Some(previous) = self.undo_history.pop() {
-            self.collision = previous;
-            self.selected_box = None;
+            match previous {
+                UndoAction::Collision(collision) => {
+                    self.collision = collision;
+                    self.selected_box = None;
+                }
+                UndoAction::Textures(state) => {
+                    self.texture_sources = state.sources;
+                    self.texture_path = state.texture_path;
+                    if let Some(model) = &mut self.model {
+                        model.textures = state.model_textures;
+                    }
+                    self.rebuild_texture_atlas();
+                }
+            }
             self.status_message = "Действие отменено.".to_string();
         }
+    }
+
+    fn save_texture_undo_point(&mut self) {
+        self.undo_history.push(UndoAction::Textures(TextureState {
+            sources: self.texture_sources.clone(),
+            texture_path: self.texture_path.clone(),
+            model_textures: self.model.as_ref().and_then(|model| model.textures.clone()),
+        }));
+    }
+
+    fn remove_texture_slot(&mut self, slot: &str) {
+        if !self.texture_sources.contains_key(slot) {
+            return;
+        }
+        self.save_texture_undo_point();
+        self.texture_sources.remove(slot);
+        if let Some(textures) = self
+            .model
+            .as_mut()
+            .and_then(|model| model.textures.as_mut())
+        {
+            textures.remove(slot);
+        }
+        self.texture_path = self.texture_sources.values().next().cloned();
+        self.rebuild_texture_atlas();
+        self.status_message = format!("Текстура #{slot} удалена. Ctrl+Z — вернуть.");
     }
 
     fn convert_bb_coords(v: [f32; 3]) -> Vec3 {
@@ -275,38 +333,359 @@ impl CollisionEditorApp {
         self.texture_path = None;
         self.loaded_texture = None;
         self.preview_texture = None;
+        self.texture_sources.clear();
+        self.atlas_regions.clear();
+        self.texture_dimensions.clear();
     }
 
     fn load_texture_from_path(&mut self, path: PathBuf) {
-        if let Ok(img) = image::open(&path) {
-            self.loaded_texture = Some(img.to_rgba8());
-            self.preview_texture = None;
-            self.texture_path = Some(path.clone());
-            self.status_message = format!(
-                "Загружена текстура: {:?}",
-                path.file_name().unwrap_or_default()
-            );
+        self.load_texture_files(vec![path]);
+    }
+
+    fn single_texture_slots(&self) -> Option<Vec<String>> {
+        if let Some(textures) = self
+            .model
+            .as_ref()
+            .and_then(|model| model.textures.as_ref())
+        {
+            let unique_paths: std::collections::HashSet<_> = textures
+                .values()
+                .filter_map(|value| value.as_str())
+                .collect();
+            if unique_paths.len() <= 1 {
+                return Some(textures.keys().cloned().collect());
+            }
+            return None;
         }
+        (self.texture_sources.len() <= 1).then(|| {
+            if self.texture_sources.is_empty() {
+                vec!["0".to_string()]
+            } else {
+                self.texture_sources.keys().cloned().collect()
+            }
+        })
+    }
+
+    fn replace_single_texture(&mut self, path: PathBuf, slots: Vec<String>) {
+        self.texture_sources.clear();
+        let slots = if slots.is_empty() {
+            vec!["0".to_string()]
+        } else {
+            slots
+        };
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("texture.png")
+            .to_string();
+        for slot in &slots {
+            self.texture_sources.insert(slot.clone(), path.clone());
+        }
+        if let Some(model) = &mut self.model {
+            let textures = model.textures.get_or_insert_with(HashMap::new);
+            for slot in slots {
+                textures.insert(slot, serde_json::Value::String(file_name.clone()));
+            }
+        }
+        self.texture_path = Some(path);
+    }
+
+    fn slot_for_path(&self, path: &Path) -> String {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        self.model
+            .as_ref()
+            .and_then(|model| model.textures.as_ref())
+            .and_then(|textures| {
+                textures.iter().find_map(|(slot, value)| {
+                    value
+                        .as_str()
+                        .filter(|reference| {
+                            Path::new(reference)
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                == Some(file_name)
+                        })
+                        .map(|_| slot.clone())
+                })
+            })
+            .unwrap_or_else(|| self.texture_sources.len().to_string())
+    }
+
+    fn rebuild_texture_atlas(&mut self) {
+        // Several Minecraft aliases (`all`, `particle`, `0`) often point to
+        // exactly the same PNG. Keep one physical copy and let every slot share
+        // its region; duplicate copies made UV errors much easier to see.
+        let mut unique: Vec<(PathBuf, RgbaImage)> = Vec::new();
+        for (_slot, path) in &self.texture_sources {
+            if let Ok(image) = image::open(path) {
+                if !unique.iter().any(|(known, _)| known == path) {
+                    unique.push((path.clone(), image.to_rgba8()));
+                }
+            }
+        }
+        if unique.is_empty() {
+            self.loaded_texture = None;
+            self.preview_texture = None;
+            self.atlas_regions.clear();
+            self.texture_dimensions.clear();
+            return;
+        }
+        // A single physical image must remain byte-for-byte equivalent to the
+        // original renderer. Do not route it through atlas scaling/padding:
+        // this is also the common legacy Blockbench case.
+        if unique.len() == 1 {
+            let (_, image) = unique.pop().unwrap();
+            self.loaded_texture = Some(image.clone());
+            self.atlas_regions.clear();
+            self.texture_dimensions.clear();
+            for (slot, source) in &self.texture_sources {
+                if image::open(source).is_ok() {
+                    self.atlas_regions
+                        .insert(slot.clone(), [0.0, 0.0, 1.0, 1.0]);
+                    self.texture_dimensions
+                        .insert(slot.clone(), [image.width() as f32, image.height() as f32]);
+                }
+            }
+            self.preview_texture = None;
+            return;
+        }
+        unique.sort_by(|a, b| a.0.cmp(&b.0));
+        const PADDING: u32 = 2;
+        let atlas_width: u32 = unique
+            .iter()
+            .map(|(_, image)| image.width() + PADDING)
+            .sum();
+        let atlas_height = unique
+            .iter()
+            .map(|(_, image)| image.height() + PADDING)
+            .max()
+            .unwrap_or(1);
+        let mut atlas = RgbaImage::new(atlas_width, atlas_height);
+        self.atlas_regions.clear();
+        let mut x = 0;
+        for (path, image) in unique {
+            let left = x + PADDING / 2;
+            image::imageops::replace(&mut atlas, &image, left.into(), (PADDING / 2).into());
+            let region = [
+                left as f32 / atlas_width as f32,
+                (PADDING / 2) as f32 / atlas_height as f32,
+                (left + image.width()) as f32 / atlas_width as f32,
+                (PADDING / 2 + image.height()) as f32 / atlas_height as f32,
+            ];
+            for (slot, source) in &self.texture_sources {
+                if source == &path {
+                    self.atlas_regions.insert(slot.clone(), region);
+                    self.texture_dimensions
+                        .insert(slot.clone(), [image.width() as f32, image.height() as f32]);
+                }
+            }
+            x += image.width() + PADDING;
+        }
+        self.loaded_texture = Some(atlas);
+        self.preview_texture = None;
+    }
+
+    fn load_texture_files(&mut self, paths: Vec<PathBuf>) {
+        // Replacing the skin of an ordinary one-texture model must stay a
+        // replacement. The previous behaviour kept inventing slots 1, 2, … .
+        if paths.len() == 1 {
+            if let Some(slots) = self.single_texture_slots() {
+                let path = paths.into_iter().next().unwrap();
+                if image::open(&path).is_ok() {
+                    self.save_texture_undo_point();
+                    self.replace_single_texture(path, slots);
+                    self.rebuild_texture_atlas();
+                    self.status_message = "Текстура модели заменена.".to_string();
+                }
+                return;
+            }
+        }
+        if paths.iter().any(|path| image::open(path).is_ok()) {
+            self.save_texture_undo_point();
+        }
+        let mut loaded = 0;
+        for path in paths {
+            if image::open(&path).is_ok() {
+                let slot = self.slot_for_path(&path);
+                self.texture_sources.insert(slot.clone(), path.clone());
+                // A model imported without `textures` becomes a valid Minecraft
+                // multi-texture model on export. Face references such as #0/#1
+                // therefore work without manual JSON editing.
+                if let Some(model) = &mut self.model {
+                    let textures = model.textures.get_or_insert_with(HashMap::new);
+                    textures.entry(slot).or_insert_with(|| {
+                        serde_json::Value::String(
+                            path.file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("texture.png")
+                                .to_string(),
+                        )
+                    });
+                }
+                self.texture_path.get_or_insert(path);
+                loaded += 1;
+            }
+        }
+        self.rebuild_texture_atlas();
+        if loaded > 0 {
+            self.status_message =
+                format!("Загружено текстур в atlas: {}", self.texture_sources.len());
+        }
+    }
+
+    fn load_model_textures(&mut self, model_path: &Path) {
+        let Some(textures) = self
+            .model
+            .as_ref()
+            .and_then(|model| model.textures.as_ref())
+        else {
+            return;
+        };
+        let mut resolved = Vec::new();
+        for (slot, value) in textures {
+            let Some(reference) = value.as_str() else {
+                continue;
+            };
+            let reference = reference.trim_start_matches('#');
+            if let Some(png_candidate) =
+                Self::resolve_resource_path(model_path, reference, "textures", "png")
+            {
+                resolved.push((slot.clone(), png_candidate));
+            }
+        }
+        for (slot, path) in resolved {
+            self.texture_path.get_or_insert(path.clone());
+            self.texture_sources.insert(slot, path);
+        }
+        if !self.texture_sources.is_empty() {
+            self.rebuild_texture_atlas();
+            self.status_message =
+                format!("Загружено текстур в atlas: {}", self.texture_sources.len());
+        }
+    }
+
+    /// Resolves both ordinary relative paths and Minecraft resource locations,
+    /// e.g. `stalker_decorations:block/ammo`.
+    fn resolve_resource_path(
+        origin: &Path,
+        reference: &str,
+        folder: &str,
+        extension: &str,
+    ) -> Option<PathBuf> {
+        let reference = reference.trim_start_matches('#');
+        if let Some((namespace, resource_path)) = reference.split_once(':') {
+            for ancestor in origin.ancestors() {
+                let candidate = ancestor
+                    .join("assets")
+                    .join(namespace)
+                    .join(folder)
+                    .join(resource_path)
+                    .with_extension(extension);
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+            }
+            return None;
+        }
+        let base = origin.parent().unwrap_or_else(|| Path::new("."));
+        let candidate = base.join(reference);
+        let candidate = if candidate.extension().is_none() {
+            candidate.with_extension(extension)
+        } else {
+            candidate
+        };
+        candidate.exists().then_some(candidate)
+    }
+
+    fn merge_parent_model(
+        mut parent: serde_json::Value,
+        child: serde_json::Value,
+    ) -> serde_json::Value {
+        let (Some(parent_object), Some(child_object)) = (parent.as_object_mut(), child.as_object())
+        else {
+            return child;
+        };
+        for (key, child_value) in child_object {
+            if key == "parent" {
+                continue;
+            }
+            if key == "textures" {
+                let parent_textures = parent_object
+                    .entry(key.clone())
+                    .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+                if let (Some(parent_map), Some(child_map)) =
+                    (parent_textures.as_object_mut(), child_value.as_object())
+                {
+                    for (texture_key, texture_value) in child_map {
+                        parent_map.insert(texture_key.clone(), texture_value.clone());
+                    }
+                    continue;
+                }
+            }
+            parent_object.insert(key.clone(), child_value.clone());
+        }
+        parent
+    }
+
+    fn resolve_inherited_model(path: &Path, depth: u8) -> Result<serde_json::Value, String> {
+        if depth > 16 {
+            return Err("Слишком глубокая цепочка parent-моделей".to_string());
+        }
+        let content = fs::read_to_string(path)
+            .map_err(|e| format!("Не удалось прочитать {}: {e}", path.display()))?;
+        let mut child: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|e| format!("Ошибка JSON в {}: {e}", path.display()))?;
+        let parent_reference = child
+            .get("parent")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        let Some(parent_reference) = parent_reference else {
+            return Ok(child);
+        };
+        let parent_path = Self::resolve_resource_path(path, &parent_reference, "models", "json")
+            .ok_or_else(|| format!("Parent не найден: {parent_reference}"))?;
+        let parent = Self::resolve_inherited_model(&parent_path, depth + 1)?;
+        child.as_object_mut().map(|object| object.remove("parent"));
+        Ok(Self::merge_parent_model(parent, child))
     }
 
     fn load_model_from_string(&mut self, content: String, opt_path: Option<PathBuf>) {
         // Очищаем старую текстуру при смене модели
         self.clear_texture();
 
-        match serde_json::from_str::<RawModel>(&content) {
+        let resolved_content = match &opt_path {
+            Some(path) => match Self::resolve_inherited_model(path, 0)
+                .and_then(|value| serde_json::to_string_pretty(&value).map_err(|e| e.to_string()))
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    self.status_message = format!("Ошибка импорта parent: {error}");
+                    return;
+                }
+            },
+            None => content,
+        };
+        match serde_json::from_str::<RawModel>(&resolved_content) {
             Ok(parsed) => {
+                self.raw_model_json = resolved_content;
+                self.model = Some(parsed);
                 if let Some(path) = &opt_path {
                     if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                         self.meta.uid = stem.to_string();
                         self.meta.name = stem.to_string();
                     }
-                    let potential_tex = path.with_extension("png");
-                    if potential_tex.exists() {
-                        self.load_texture_from_path(potential_tex);
+                    self.load_model_textures(path);
+                    // Backward compatibility: one PNG with the model's name.
+                    if self.texture_sources.is_empty() {
+                        let potential_tex = path.with_extension("png");
+                        if potential_tex.exists() {
+                            self.load_texture_from_path(potential_tex);
+                        }
                     }
                 }
-                self.raw_model_json = content;
-                self.model = Some(parsed);
                 self.regenerate_collision(); // Merge по умолчанию
                 self.status_message = "Модель успешно загружена!".to_string();
             }
@@ -663,6 +1042,15 @@ impl CollisionEditorApp {
         let faces = elem.faces.as_ref()?;
         let face = faces.get(face_name)?;
         let uv = face.uv.unwrap_or([0.0, 0.0, 16.0, 16.0]);
+        let requested_slot = face
+            .texture
+            .as_deref()
+            .unwrap_or("0")
+            .trim_start_matches('#');
+        // Blockbench's omitted `texture_size` is explicitly 16×16 logical
+        // pixels, even when the PNG itself is a 128/256px HD image. Using the
+        // physical PNG dimensions here samples a tiny corner and stretches it
+        // over the face (the characteristic broken preview).
         let texture_size = self.model.as_ref()?.texture_size.unwrap_or([16.0, 16.0]);
         if texture_size[0] <= 0.0 || texture_size[1] <= 0.0 {
             return None;
@@ -680,6 +1068,17 @@ impl CollisionEditorApp {
         // Blockbench stores quarter-turn face rotations in texture space.
         let turns = (face.rotation.unwrap_or(0) / 90) % 4;
         corners.rotate_right(turns as usize);
+        // A face texture (`#0`, `#metal`) occupies just one region of the
+        // combined atlas. Untextured / legacy faces use the first region.
+        let region = if face.texture.is_some() {
+            self.atlas_regions.get(requested_slot)?
+        } else {
+            self.atlas_regions.values().next()?
+        };
+        for corner in &mut corners {
+            corner.x = region[0] + corner.x * (region[2] - region[0]);
+            corner.y = region[1] + corner.y * (region[3] - region[1]);
+        }
         Some(corners)
     }
 
@@ -741,6 +1140,57 @@ impl CollisionEditorApp {
         Ok(())
     }
 
+    fn png_file_name(path: &Path) -> String {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("texture");
+        if Path::new(name).extension().is_some() {
+            name.to_string()
+        } else {
+            format!("{name}.png")
+        }
+    }
+
+    fn exported_model_json(&self) -> Result<Vec<u8>, String> {
+        let mut json: serde_json::Value = serde_json::from_str(&self.raw_model_json)
+            .map_err(|e| format!("Некорректный model.json: {e}"))?;
+        let object = json
+            .as_object_mut()
+            .ok_or_else(|| "Корень model.json должен быть объектом".to_string())?;
+        match self
+            .model
+            .as_ref()
+            .and_then(|model| model.textures.as_ref())
+        {
+            Some(model_textures) => {
+                object.insert(
+                    "textures".to_string(),
+                    serde_json::to_value(model_textures).map_err(|e| e.to_string())?,
+                );
+            }
+            None => {
+                object.remove("textures");
+            }
+        }
+        if !self.texture_sources.is_empty() {
+            let textures = object
+                .entry("textures")
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .ok_or_else(|| "Поле textures должно быть объектом".to_string())?;
+            for (slot, source) in &self.texture_sources {
+                // A standalone exported package must not retain resource
+                // locations pointing at the original resource pack.
+                textures.insert(
+                    slot.clone(),
+                    serde_json::Value::String(Self::png_file_name(source)),
+                );
+            }
+        }
+        serde_json::to_vec_pretty(&json).map_err(|e| e.to_string())
+    }
+
     fn export_package(&mut self) {
         if let Some(target_dir) = rfd::FileDialog::new().pick_folder() {
             let pkg_dir = target_dir.join(&self.meta.uid);
@@ -756,6 +1206,13 @@ impl CollisionEditorApp {
                 self.status_message = "Экспорт отменён: сначала загрузите модель.".to_string();
                 return;
             }
+            let model_json = match self.exported_model_json() {
+                Ok(json) => json,
+                Err(error) => {
+                    self.status_message = error;
+                    return;
+                }
+            };
             if let Err(e) = fs::File::create(pkg_dir.join("meta.json"))
                 .and_then(|file| {
                     serde_json::to_writer_pretty(file, &self.meta).map_err(std::io::Error::other)
@@ -766,15 +1223,49 @@ impl CollisionEditorApp {
                         serde_json::to_vec_pretty(&self.collision).unwrap(),
                     )
                 })
-                .and_then(|_| fs::write(pkg_dir.join("model.json"), &self.raw_model_json))
+                .and_then(|_| fs::write(pkg_dir.join("model.json"), &model_json))
             {
                 self.status_message = format!("Ошибка экспорта: {e}");
                 return;
             }
             if let Some(tex) = &self.texture_path {
-                if let Err(e) = Self::copy_texture_safely(tex, &pkg_dir.join("texture.png")) {
-                    self.status_message = e;
-                    return;
+                if self.texture_sources.len() <= 1 {
+                    let export_name = self
+                        .texture_sources
+                        .keys()
+                        .next()
+                        .and_then(|slot| {
+                            self.model
+                                .as_ref()
+                                .and_then(|model| model.textures.as_ref())
+                                .and_then(|textures| textures.get(slot))
+                        })
+                        .and_then(|value| value.as_str())
+                        .map(Path::new)
+                        .map(Self::png_file_name)
+                        .unwrap_or_else(|| "texture.png".to_string());
+                    if let Err(e) = Self::copy_texture_safely(tex, &pkg_dir.join(export_name)) {
+                        self.status_message = e;
+                        return;
+                    }
+                } else {
+                    for (slot, source) in &self.texture_sources {
+                        let export_name = self
+                            .model
+                            .as_ref()
+                            .and_then(|model| model.textures.as_ref())
+                            .and_then(|textures| textures.get(slot))
+                            .and_then(|value| value.as_str())
+                            .map(Path::new)
+                            .map(Self::png_file_name)
+                            .unwrap_or_else(|| Self::png_file_name(source));
+                        if let Err(e) =
+                            Self::copy_texture_safely(source, &pkg_dir.join(export_name))
+                        {
+                            self.status_message = e;
+                            return;
+                        }
+                    }
                 }
             }
 
@@ -931,8 +1422,15 @@ impl CollisionEditorApp {
             }
         }
 
-        // 2. Треугольники модели (Рендеринг без culling)
+        // 2. Model faces. `egui` is a 2D painter, so we explicitly cull back
+        // faces and tessellate textured quads for stable perspective UVs.
         let light_dir = Vec3::new(0.5_f32, 0.8_f32, 0.4_f32).normalize();
+        let camera_eye = self.camera.target
+            + Vec3::new(
+                self.camera.distance * self.camera.yaw.cos() * self.camera.pitch.cos(),
+                self.camera.distance * self.camera.pitch.sin(),
+                self.camera.distance * self.camera.yaw.sin() * self.camera.pitch.cos(),
+            );
         let mut triangles: Vec<Triangle3D> = Vec::new();
         let mut textured_quads: Vec<TexturedQuad3D> = Vec::new();
 
@@ -952,12 +1450,30 @@ impl CollisionEditorApp {
                     ];
 
                     for (i0, i1, i2, i3, face_name) in quads {
+                        // Minecraft elements may intentionally omit faces (thin
+                        // cut-outs, open frames, transparent constructions).
+                        // Drawing all six cube sides created the large bogus
+                        // planes visible in the broken preview.
+                        if !elem
+                            .faces
+                            .as_ref()
+                            .is_some_and(|faces| faces.contains_key(face_name))
+                        {
+                            continue;
+                        }
                         let p0 = c[i0];
                         let p1 = c[i1];
                         let p2 = c[i2];
                         let p3 = c[i3];
 
                         let norm = (p1 - p0).cross(p2 - p0).normalize_or_zero();
+                        // Corner order produces an inward normal; its negative is
+                        // the Minecraft face's outward normal.
+                        let outward = -norm;
+                        let face_center = (p0 + p1 + p2 + p3) * 0.25;
+                        if outward.dot(camera_eye - face_center) <= 0.000_001 {
+                            continue;
+                        }
                         let dot = norm.dot(light_dir).abs();
                         let intensity = (0.45_f32 + 0.55_f32 * dot).clamp(0.0_f32, 1.0_f32);
 
@@ -972,11 +1488,44 @@ impl CollisionEditorApp {
 
                         if self.preview_texture.is_some() {
                             if let Some(uv) = self.face_uv(elem, face_name) {
-                                textured_quads.push(TexturedQuad3D {
-                                    positions: [p0, p1, p2, p3],
-                                    uv,
-                                    avg_depth: (d1 + d2) * 0.5_f32,
-                                });
+                                const SUBDIVISIONS: usize = 4;
+                                let bilerp3 =
+                                    |u: f32, v: f32| p0.lerp(p1, u).lerp(p3.lerp(p2, u), v);
+                                let bilerp2 = |u: f32, v: f32| {
+                                    uv[0].lerp(uv[1], u).lerp(uv[3].lerp(uv[2], u), v)
+                                };
+                                for y in 0..SUBDIVISIONS {
+                                    for x in 0..SUBDIVISIONS {
+                                        let u0 = x as f32 / SUBDIVISIONS as f32;
+                                        let u1 = (x + 1) as f32 / SUBDIVISIONS as f32;
+                                        let v0 = y as f32 / SUBDIVISIONS as f32;
+                                        let v1 = (y + 1) as f32 / SUBDIVISIONS as f32;
+                                        let positions = [
+                                            bilerp3(u0, v0),
+                                            bilerp3(u1, v0),
+                                            bilerp3(u1, v1),
+                                            bilerp3(u0, v1),
+                                        ];
+                                        let cell_uv = [
+                                            bilerp2(u0, v0),
+                                            bilerp2(u1, v0),
+                                            bilerp2(u1, v1),
+                                            bilerp2(u0, v1),
+                                        ];
+                                        let avg_depth = positions
+                                            .iter()
+                                            .map(|point| {
+                                                (view * Vec4::new(point.x, point.y, point.z, 1.0)).z
+                                            })
+                                            .sum::<f32>()
+                                            * 0.25;
+                                        textured_quads.push(TexturedQuad3D {
+                                            positions,
+                                            uv: cell_uv,
+                                            avg_depth,
+                                        });
+                                    }
+                                }
                                 continue;
                             }
                         }
@@ -1250,12 +1799,12 @@ impl eframe::App for CollisionEditorApp {
                             }
                         }
                     }
-                    if ui.button("🖼 Текстура").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
+                    if ui.button("🖼 Текстуры").clicked() {
+                        if let Some(paths) = rfd::FileDialog::new()
                             .add_filter("Image", &["png"])
-                            .pick_file()
+                            .pick_files()
                         {
-                            self.load_texture_from_path(path);
+                            self.load_texture_files(paths);
                         }
                     }
                     if ui
@@ -1287,11 +1836,37 @@ impl eframe::App for CollisionEditorApp {
                     }
                 });
 
-                if let Some(path) = &self.texture_path {
-                    ui.label(format!(
-                        "🖼 {}",
-                        path.file_name().unwrap_or_default().to_string_lossy()
-                    ));
+                if !self.texture_sources.is_empty() {
+                    ui.label(format!("🖼 Atlas: {} текстур", self.texture_sources.len()));
+                    let mut texture_rows: Vec<_> = self
+                        .texture_sources
+                        .iter()
+                        .map(|(slot, path)| (slot.clone(), path.clone()))
+                        .collect();
+                    texture_rows.sort_by(|a, b| a.0.cmp(&b.0));
+                    let mut remove_slot = None;
+                    for (slot, path) in texture_rows {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "#{slot}  {}",
+                                    path.file_name().unwrap_or_default().to_string_lossy()
+                                ))
+                                .small()
+                                .weak(),
+                            );
+                            if ui
+                                .small_button("✕")
+                                .on_hover_text("Убрать texture-slot из пререндера и экспорта")
+                                .clicked()
+                            {
+                                remove_slot = Some(slot);
+                            }
+                        });
+                    }
+                    if let Some(slot) = remove_slot {
+                        self.remove_texture_slot(&slot);
+                    }
                 } else {
                     ui.label("🖼 Текстура не назначена (шейдинг)");
                 }
@@ -1531,7 +2106,8 @@ impl eframe::App for CollisionEditorApp {
                     });
 
                 if self.collision != collision_before_edit {
-                    self.undo_history.push(collision_before_edit);
+                    self.undo_history
+                        .push(UndoAction::Collision(collision_before_edit));
                 }
 
                 if let Some(idx) = to_delete {
@@ -1663,5 +2239,113 @@ mod tests {
         ]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].half_size, [0.5, 0.25, 0.25]);
+    }
+
+    #[test]
+    fn export_adds_texture_slots_without_dropping_model_fields() {
+        let mut app = CollisionEditorApp::default();
+        app.raw_model_json = r#"{"parent":"block/cube","elements":[]}"#.to_string();
+        app.texture_sources
+            .insert("0".to_string(), PathBuf::from("bed.png"));
+        app.texture_sources
+            .insert("1".to_string(), PathBuf::from("metal.png"));
+        let json: serde_json::Value =
+            serde_json::from_slice(&app.exported_model_json().unwrap()).unwrap();
+        assert_eq!(json["parent"], "block/cube");
+        assert_eq!(json["textures"]["0"], "bed.png");
+        assert_eq!(json["textures"]["1"], "metal.png");
+    }
+
+    #[test]
+    fn parent_resource_model_is_flattened_and_child_textures_override() {
+        let root = std::env::temp_dir().join(format!("swrmc-parent-{}", std::process::id()));
+        let parent_dir = root.join("assets/example/models/custom");
+        let child_dir = root.join("assets/example/models/item");
+        fs::create_dir_all(&parent_dir).unwrap();
+        fs::create_dir_all(&child_dir).unwrap();
+        let parent_path = parent_dir.join("ammo.json");
+        let child_path = child_dir.join("child.json");
+        fs::write(&parent_path, r#"{"textures":{"0":"example:block/base"},"elements":[{"from":[0,0,0],"to":[16,16,16]}]}"#).unwrap();
+        fs::write(&child_path, r#"{"parent":"example:custom/ammo","textures":{"0":"example:block/child"},"render_type":"solid"}"#).unwrap();
+        let value = CollisionEditorApp::resolve_inherited_model(&child_path, 0).unwrap();
+        assert!(value.get("parent").is_none());
+        assert_eq!(value["textures"]["0"], "example:block/child");
+        assert_eq!(value["elements"].as_array().unwrap().len(), 1);
+        assert_eq!(value["render_type"], "solid");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn single_texture_replacement_does_not_create_extra_slots() {
+        let mut app = CollisionEditorApp::default();
+        app.model = Some(RawModel {
+            credit: None,
+            texture_size: Some([16.0, 16.0]),
+            textures: Some(HashMap::from([(
+                "0".to_string(),
+                serde_json::Value::String("old.png".to_string()),
+            )])),
+            elements: vec![],
+        });
+        let slots = app.single_texture_slots().unwrap();
+        app.replace_single_texture(PathBuf::from("new.png"), slots);
+        assert_eq!(app.texture_sources.len(), 1);
+        assert_eq!(app.texture_sources["0"], PathBuf::from("new.png"));
+        assert_eq!(app.model.unwrap().textures.unwrap()["0"], "new.png");
+    }
+
+    #[test]
+    fn removed_texture_slot_disappears_from_export_and_undo_restores_it() {
+        let mut app = CollisionEditorApp::default();
+        app.raw_model_json = r#"{"textures":{"0":"old.png"},"elements":[]}"#.to_string();
+        app.model = Some(RawModel {
+            credit: None,
+            texture_size: Some([16.0, 16.0]),
+            textures: Some(HashMap::from([(
+                "0".to_string(),
+                serde_json::Value::String("old.png".to_string()),
+            )])),
+            elements: vec![],
+        });
+        app.texture_sources
+            .insert("0".to_string(), PathBuf::from("old.png"));
+        app.remove_texture_slot("0");
+        let without_slot: serde_json::Value =
+            serde_json::from_slice(&app.exported_model_json().unwrap()).unwrap();
+        assert!(without_slot["textures"].get("0").is_none());
+        app.undo_collision_edit();
+        assert_eq!(app.texture_sources["0"], PathBuf::from("old.png"));
+        assert_eq!(app.model.unwrap().textures.unwrap()["0"], "old.png");
+    }
+
+    #[test]
+    fn omitted_texture_size_uses_blockbench_sixteen_pixel_grid() {
+        let mut app = CollisionEditorApp::default();
+        app.model = Some(RawModel {
+            credit: None,
+            texture_size: None,
+            textures: None,
+            elements: vec![],
+        });
+        app.texture_dimensions
+            .insert("0".to_string(), [256.0, 256.0]);
+        app.atlas_regions
+            .insert("0".to_string(), [0.0, 0.0, 1.0, 1.0]);
+        let element = RawElement {
+            from: [0.0, 0.0, 0.0],
+            to: [1.0, 1.0, 1.0],
+            rotation: None,
+            faces: Some(HashMap::from([(
+                "north".to_string(),
+                RawFace {
+                    uv: Some([0.0, 0.0, 8.0, 8.0]),
+                    texture: None,
+                    rotation: None,
+                },
+            )])),
+        };
+        let uv = app.face_uv(&element, "north").unwrap();
+        assert!((uv[1].x - 0.5).abs() < 0.0001);
+        assert!((uv[2].y - 0.5).abs() < 0.0001);
     }
 }
