@@ -43,7 +43,9 @@ jobs:
             target: aarch64-apple-darwin
             archive: tar.gz
           - name: macOS Intel
-            os: macos-13
+            # macos-13 is retired on GitHub-hosted runners. Keep the Intel
+            # target while using the current Intel runner label.
+            os: macos-15-intel
             target: x86_64-apple-darwin
             archive: tar.gz
           - name: Linux x64
