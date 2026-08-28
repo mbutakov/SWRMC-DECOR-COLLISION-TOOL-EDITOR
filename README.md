@@ -20,4 +20,4 @@ cargo run --release
 
 ## Релиз
 
-В GitHub Actions запустите workflow **Build SWRMC** вручную и укажите тег версии. Сборки Windows, macOS и Linux появятся в созданном релизе.
+В GitHub Actions запустите workflow **Build SWRMC** вручную и укажите тег версии. Сборки Windows, macOS Apple Silicon и Linux появятся в созданном релизе.
