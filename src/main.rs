@@ -1,6 +1,11 @@
 mod camera;
 mod collision;
+mod collision_asset;
+mod collision_editor;
+mod export_io;
 mod history;
+mod light;
+mod model_import;
 
 use camera::Camera;
 use eframe::egui;
@@ -30,6 +35,8 @@ pub struct RawModel {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawRotation {
+    #[serde(default)]
+    pub rescale: bool,
     pub angle: f32,
     pub axis: String,
     pub origin: [f32; 3],
@@ -59,10 +66,26 @@ pub struct RawFace {
 // always stored as pitch (X), yaw (Y), roll (Z), in degrees.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ObbBox {
+    #[serde(
+        default,
+        skip_serializing_if = "collision_editor::Settings::is_default"
+    )]
+    pub settings: collision_editor::Settings,
     pub center: [f32; 3],
     #[serde(rename = "halfSize", alias = "extents")]
     pub half_size: [f32; 3],
     pub rotation: [f32; 3],
+}
+
+impl Default for ObbBox {
+    fn default() -> Self {
+        Self {
+            center: [0., 0.25, 0.],
+            half_size: [0.25; 3],
+            rotation: [0.; 3],
+            settings: Default::default(),
+        }
+    }
 }
 
 impl ObbBox {
@@ -70,10 +93,20 @@ impl ObbBox {
         Vec3::from_slice(&self.center)
     }
     pub fn half_size_v(&self) -> Vec3 {
+        if self.settings.kind == collision_asset::Kind::Capsule {
+            return Vec3::new(
+                self.settings.radius,
+                self.settings.radius + self.settings.half_segment,
+                self.settings.radius,
+            );
+        }
         Vec3::from_slice(&self.half_size)
     }
 
     pub fn rotation_quat(&self) -> Quat {
+        if self.settings.kind == collision_asset::Kind::Aabb {
+            return Quat::IDENTITY;
+        }
         Quat::from_euler(
             EulerRot::XYZ,
             self.rotation[0].to_radians(),
@@ -131,16 +164,21 @@ pub struct CollisionData {
 }
 
 /// Reads v2 OBB metadata and legacy AABB files (`min`/`max`).  The legacy data
-/// is converted only in memory; every export is the canonical v2 form.
+/// is converted into editor primitives; package export uses collision_asset v1.
 fn parse_collision_data(content: &str) -> Result<CollisionData, String> {
     #[derive(Deserialize)]
     struct Input {
         #[serde(default)]
         version: u32,
-        #[serde(default)]
         boxes: Vec<serde_json::Value>,
     }
-    let input: Input = serde_json::from_str(content).map_err(|e| e.to_string())?;
+    let value: serde_json::Value = serde_json::from_str(content).map_err(|e| e.to_string())?;
+    if value.get("format").is_some() {
+        return serde_json::from_value::<collision_asset::Asset>(value)
+            .map_err(|e| e.to_string())?
+            .into_editor();
+    }
+    let input: Input = serde_json::from_value(value).map_err(|e| e.to_string())?;
     if input.version > 2 {
         return Err(format!("Unsupported collision version: {}", input.version));
     }
@@ -156,7 +194,11 @@ fn parse_collision_data(content: &str) -> Result<CollisionData, String> {
             let lo = Vec3::from_array(min).min(Vec3::from_array(max));
             let hi = Vec3::from_array(min).max(Vec3::from_array(max));
             boxes.push(ObbBox {
-                center: ((lo + hi) * 0.5).to_array(),
+                settings: collision_editor::Settings {
+                    kind: collision_asset::Kind::Aabb,
+                    ..Default::default()
+                },
+                center: (lo * 0.5 + hi * 0.5).to_array(),
                 half_size: ((hi - lo) * 0.5).to_array(),
                 rotation: [0.0; 3],
             });
@@ -164,6 +206,7 @@ fn parse_collision_data(content: &str) -> Result<CollisionData, String> {
             boxes.push(serde_json::from_value(raw).map_err(|e| format!("Invalid OBB: {e}"))?);
         }
     }
+    collision_editor::validate_editor(&boxes)?;
     Ok(CollisionData { version: 2, boxes })
 }
 
@@ -183,8 +226,12 @@ pub struct MetaData {
 // ==========================================
 
 struct CollisionEditorApp {
+    light_editor: light::Editor,
     raw_model_json: String,
     model: Option<RawModel>,
+    obj: Option<model_import::Mesh>,
+    obj_transform: model_import::Transform,
+    triangle_buffer: Vec<Triangle3D>,
     meta: MetaData,
     collision: CollisionData,
     texture_path: Option<PathBuf>,
@@ -222,15 +269,24 @@ struct TextureState {
 }
 
 enum UndoAction {
-    Collision(CollisionData),
+    Lights(light::Document),
+    Collision(CollisionData, model_import::Transform),
     Textures(TextureState),
 }
 
 impl Default for CollisionEditorApp {
     fn default() -> Self {
         Self {
+            light_editor: light::Editor {
+                guides: true,
+                environment: true,
+                ..Default::default()
+            },
             raw_model_json: String::new(),
             model: None,
+            obj: None,
+            obj_transform: Default::default(),
+            triangle_buffer: Vec::new(),
             meta: MetaData {
                 uid: "model".to_string(),
                 name: "model".to_string(),
@@ -256,7 +312,7 @@ impl Default for CollisionEditorApp {
             show_collision: true,
             show_grid: true,
             selected_box: None,
-            status_message: "Перетащите .json модель в окно программы.".to_string(),
+            status_message: "Перетащите .json или .obj модель в окно программы.".to_string(),
             generation_mode: 2,
             optimization_steps: 8,
             merge_tolerance: 0.015,
@@ -271,14 +327,23 @@ impl Default for CollisionEditorApp {
 
 impl CollisionEditorApp {
     fn save_undo_point(&mut self) {
-        self.undo_history
-            .push(UndoAction::Collision(self.collision.clone()));
+        self.undo_history.push(UndoAction::Collision(
+            self.collision.clone(),
+            self.obj_transform,
+        ));
     }
 
     fn undo_collision_edit(&mut self) {
         if let Some(previous) = self.undo_history.pop() {
             match previous {
-                UndoAction::Collision(collision) => {
+                UndoAction::Lights(document) => {
+                    self.light_editor.document = Some(document);
+                    self.light_editor.selected = None;
+                    self.light_editor.active_element = None;
+                    self.light_editor.selected_elements.clear();
+                }
+                UndoAction::Collision(collision, transform) => {
+                    self.obj_transform = transform;
                     self.collision = collision;
                     self.selected_box = None;
                 }
@@ -415,6 +480,16 @@ impl CollisionEditorApp {
     }
 
     fn rebuild_texture_atlas(&mut self) {
+        if self.obj.is_some() {
+            self.preview_texture = None;
+            self.loaded_texture = self
+                .texture_path
+                .as_ref()
+                .and_then(|p| image::open(p).ok())
+                .map(|i| i.to_rgba8());
+            return;
+        }
+
         // Several Minecraft aliases (`all`, `particle`, `0`) often point to
         // exactly the same PNG. Keep one physical copy and let every slot share
         // its region; duplicate copies made UV errors much easier to see.
@@ -489,6 +564,23 @@ impl CollisionEditorApp {
     }
 
     fn load_texture_files(&mut self, paths: Vec<PathBuf>) {
+        if self.obj.is_some() {
+            if let Some(path) = paths.into_iter().next() {
+                match image::open(&path) {
+                    Ok(image) => {
+                        self.save_texture_undo_point();
+                        self.clear_texture();
+                        self.loaded_texture = Some(image.to_rgba8());
+                        self.texture_sources.insert("0".into(), path.clone());
+                        self.texture_path = Some(path);
+                        self.status_message = "OBJ PNG текстура загружена (UV из OBJ).".into();
+                    }
+                    Err(e) => self.status_message = format!("Ошибка PNG: {e}"),
+                }
+            }
+            return;
+        }
+
         // Replacing the skin of an ordinary one-texture model must stay a
         // replacement. The previous behaviour kept inventing slots 1, 2, … .
         if paths.len() == 1 {
@@ -588,6 +680,40 @@ impl CollisionEditorApp {
                     return Some(candidate);
                 }
             }
+
+            // Imported models are often selected directly from a models
+            // directory instead of from a complete resource pack. In that
+            // case a namespaced parent such as `namespace:block/base` can
+            // still refer to a sibling file next to the imported model.
+            let base = origin.parent().unwrap_or_else(|| Path::new("."));
+            let resource_path = Path::new(resource_path);
+            let mut local_candidates = vec![base.join(resource_path)];
+            if let Ok(path) = resource_path.strip_prefix(folder) {
+                local_candidates.push(base.join(path));
+            }
+            if base.file_name()
+                == resource_path
+                    .components()
+                    .next()
+                    .and_then(|component| match component {
+                        std::path::Component::Normal(name) => Some(name),
+                        _ => None,
+                    })
+            {
+                if let Some(file_name) = resource_path.file_name() {
+                    local_candidates.push(base.join(file_name));
+                }
+            }
+            for candidate in local_candidates {
+                let candidate = if candidate.extension().is_none() {
+                    candidate.with_extension(extension)
+                } else {
+                    candidate
+                };
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+            }
             return None;
         }
         let base = origin.parent().unwrap_or_else(|| Path::new("."));
@@ -636,7 +762,11 @@ impl CollisionEditorApp {
         }
         let content = fs::read_to_string(path)
             .map_err(|e| format!("Не удалось прочитать {}: {e}", path.display()))?;
-        let mut child: serde_json::Value = serde_json::from_str(&content)
+        // Some Minecraft resource files are saved with a UTF-8 BOM. It is
+        // harmless metadata, but serde_json otherwise reports an error at
+        // line 1, column 1 before it can resolve the parent chain.
+        let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
+        let mut child: serde_json::Value = serde_json::from_str(content)
             .map_err(|e| format!("Ошибка JSON в {}: {e}", path.display()))?;
         let parent_reference = child
             .get("parent")
@@ -652,10 +782,109 @@ impl CollisionEditorApp {
         Ok(Self::merge_parent_model(parent, child))
     }
 
-    fn load_model_from_string(&mut self, content: String, opt_path: Option<PathBuf>) {
-        // Очищаем старую текстуру при смене модели
-        self.clear_texture();
+    fn change_obj_transform(&mut self, after: model_import::Transform) -> Result<(), String> {
+        after.validate()?;
+        let before = self.obj_transform;
+        if before == after {
+            return Ok(());
+        }
+        if let Some(mesh) = &self.obj {
+            let (min, max) = mesh.bounds(after);
+            if !min.is_finite() || !max.is_finite() {
+                return Err("OBJ transform overflow".into());
+            }
+        }
+        let ratio = after.scale / before.scale;
+        if !ratio.is_finite() {
+            return Err("OBJ scale overflow".into());
+        }
+        let mut candidate = self.collision.clone();
+        let reflection = before.flip_z != after.flip_z;
+        for b in &mut candidate.boxes {
+            let mut p = Vec3::from_array(b.center);
+            if before.flip_z {
+                p.z = -p.z;
+            }
+            b.center = after.point(p / before.scale + before.origin).to_array();
+            b.half_size = (Vec3::from_array(b.half_size) * ratio).to_array();
+            b.settings.radius *= ratio;
+            b.settings.half_segment *= ratio;
+            if reflection {
+                b.rotation[0] = -b.rotation[0];
+                b.rotation[1] = -b.rotation[1];
+            }
+        }
+        collision_editor::validate_editor(&candidate.boxes)?;
+        let camera_target = after.point({
+            let mut p = self.camera.target;
+            if before.flip_z {
+                p.z = -p.z;
+            }
+            p / before.scale + before.origin
+        });
+        let camera_distance = self.camera.distance * ratio;
+        if !camera_target.is_finite() || !camera_distance.is_finite() || camera_distance <= 0. {
+            return Err("Camera transform overflow".into());
+        }
+        let old = std::mem::replace(&mut self.collision, candidate);
+        self.undo_history.push(UndoAction::Collision(old, before));
+        self.camera.target = camera_target;
+        self.camera.distance = camera_distance;
+        self.obj_transform = after;
+        Ok(())
+    }
 
+    fn load_model_path(&mut self, path: PathBuf) {
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.status_message = format!("Ошибка чтения: {e}");
+                return;
+            }
+        };
+        if path
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("obj"))
+        {
+            match model_import::Mesh::parse(&content) {
+                Err(e) => self.status_message = e,
+                Ok(mesh) => {
+                    self.clear_texture();
+                    self.texture_sources.clear();
+                    self.atlas_regions.clear();
+                    self.texture_dimensions.clear();
+                    self.model = None;
+                    self.raw_model_json.clear();
+                    self.obj = Some(mesh);
+                    self.obj_transform = Default::default();
+                    self.light_editor = light::Editor::default();
+                    self.undo_history = UndoHistory::new(100);
+                    self.selected_box = None;
+                    self.gizmo_drag = None;
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        self.meta.uid = stem.into();
+                        self.meta.name = stem.into();
+                    }
+                    self.regenerate_collision();
+                    let (min, max) = self.obj.as_ref().unwrap().bounds(self.obj_transform);
+                    self.camera.target = (min + max) * 0.5;
+                    self.camera.distance = (max - min).length().max(0.5) * 1.8;
+                    let png = path.with_extension("png");
+                    if png.exists() {
+                        self.load_texture_from_path(png);
+                    }
+                    self.status_message =
+                        "OBJ загружен. 1 единица = 1 блок, Y вверх; PNG можно загрузить отдельно."
+                            .into();
+                }
+            }
+        } else {
+            self.load_model_from_string(content, Some(path));
+        }
+    }
+
+    fn load_model_from_string(&mut self, content: String, opt_path: Option<PathBuf>) {
         let resolved_content = match &opt_path {
             Some(path) => match Self::resolve_inherited_model(path, 0)
                 .and_then(|value| serde_json::to_string_pretty(&value).map_err(|e| e.to_string()))
@@ -670,8 +899,27 @@ impl CollisionEditorApp {
         };
         match serde_json::from_str::<RawModel>(&resolved_content) {
             Ok(parsed) => {
+                let json = serde_json::from_str(&resolved_content).unwrap();
+                let document = match light::Document::read(&json) {
+                    Ok(document) => document,
+                    Err(error) => {
+                        self.status_message = format!("Ошибка света: {error}");
+                        return;
+                    }
+                };
+                self.clear_texture();
+                self.light_editor.document = Some(document);
+                self.light_editor.selected = None;
+                self.light_editor.selected_elements.clear();
+                self.light_editor.active_element = None;
+                self.light_editor.reveal_element = false;
+                self.undo_history = UndoHistory::new(100);
                 self.raw_model_json = resolved_content;
                 self.model = Some(parsed);
+                self.obj = None;
+                self.selected_box = None;
+                self.gizmo_drag = None;
+                self.collision.boxes.clear();
                 if let Some(path) = &opt_path {
                     if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                         self.meta.uid = stem.to_string();
@@ -723,15 +971,29 @@ impl CollisionEditorApp {
                 _ => (Quat::IDENTITY, [0.0, 0.0, 0.0]),
             };
 
-            let world_center = pivot + quat.mul_vec3(local_center - pivot);
+            let scale = if rot.rescale {
+                let axis = match rot.axis.as_str() {
+                    "x" => Vec3::X,
+                    "y" => Vec3::Y,
+                    "z" => Vec3::Z,
+                    _ => Vec3::ZERO,
+                };
+                axis + (Vec3::ONE - axis) / angle_rad.cos().abs().max(0.001)
+            } else {
+                Vec3::ONE
+            };
+            let world_center = pivot + quat.mul_vec3((local_center - pivot) * scale);
+            let half_size = (Vec3::from_array(half_size) * scale).to_array();
 
             ObbBox {
+                settings: Default::default(),
                 center: world_center.to_array(),
                 half_size,
                 rotation: euler_deg,
             }
         } else {
             ObbBox {
+                settings: Default::default(),
                 center: local_center.to_array(),
                 half_size,
                 rotation: [0.0, 0.0, 0.0],
@@ -740,6 +1002,18 @@ impl CollisionEditorApp {
     }
 
     fn get_raw_obbs(&self) -> Vec<ObbBox> {
+        if let Some(mesh) = &self.obj {
+            let (min, max) = mesh.bounds(self.obj_transform);
+            return vec![ObbBox {
+                center: ((min + max) * 0.5).to_array(),
+                half_size: ((max - min) * 0.5).to_array(),
+                settings: collision_editor::Settings {
+                    kind: collision_asset::Kind::Aabb,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }];
+        }
         let Some(model) = &self.model else {
             return Vec::new();
         };
@@ -775,6 +1049,7 @@ impl CollisionEditorApp {
                 let min_y = (ac.y - ae.y).min(bc.y - be.y);
                 let max_y = (ac.y + ae.y).max(bc.y + be.y);
                 candidate = Some(ObbBox {
+                    settings: Default::default(),
                     center: (a.center_v()
                         + q.mul_vec3(Vec3::new(ac.x, (min_y + max_y) * 0.5_f32, ac.z)))
                     .to_array(),
@@ -792,6 +1067,7 @@ impl CollisionEditorApp {
                 let min_x = (ac.x - ae.x).min(bc.x - be.x);
                 let max_x = (ac.x + ae.x).max(bc.x + be.x);
                 candidate = Some(ObbBox {
+                    settings: Default::default(),
                     center: (a.center_v()
                         + q.mul_vec3(Vec3::new((min_x + max_x) * 0.5_f32, ac.y, ac.z)))
                     .to_array(),
@@ -809,6 +1085,7 @@ impl CollisionEditorApp {
                 let min_z = (ac.z - ae.z).min(bc.z - be.z);
                 let max_z = (ac.z + ae.z).max(bc.z + be.z);
                 candidate = Some(ObbBox {
+                    settings: Default::default(),
                     center: (a.center_v()
                         + q.mul_vec3(Vec3::new(ac.x, ac.y, (min_z + max_z) * 0.5_f32)))
                     .to_array(),
@@ -843,6 +1120,7 @@ impl CollisionEditorApp {
         let min = amin.min(bmin);
         let max = amax.max(bmax);
         let candidate = ObbBox {
+            settings: Default::default(),
             center: ((min + max) * 0.5).to_array(),
             half_size: ((max - min) * 0.5).to_array(),
             rotation: [0.0; 3],
@@ -890,6 +1168,11 @@ impl CollisionEditorApp {
         }
 
         self.collision.boxes.clear();
+        if self.obj.is_some() {
+            self.collision.boxes = raw_obbs;
+            self.selected_box = None;
+            return;
+        }
 
         match self.generation_mode {
             // Low (1 общий монолитный AABB)
@@ -904,6 +1187,7 @@ impl CollisionEditorApp {
                 let center = (min + max) * 0.5_f32;
                 let half_size = (max - min) * 0.5_f32;
                 self.collision.boxes.push(ObbBox {
+                    settings: Default::default(),
                     center: center.to_array(),
                     half_size: half_size.to_array(),
                     rotation: [0.0, 0.0, 0.0],
@@ -957,6 +1241,7 @@ impl CollisionEditorApp {
                         max = max.max(bmax);
                     }
                     self.collision.boxes.push(ObbBox {
+                        settings: Default::default(),
                         center: ((min + max) * 0.5_f32).to_array(),
                         half_size: ((max - min) * 0.5_f32).to_array(),
                         rotation: [0.0, 0.0, 0.0],
@@ -1106,8 +1391,14 @@ impl CollisionEditorApp {
         let far = inverse * Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
         let origin = near.truncate() / near.w;
         let direction = (far.truncate() / far.w - origin).normalize_or_zero();
-        self.collision
-            .boxes
+        let raw;
+        let boxes = if self.light_editor.tab {
+            raw = self.get_raw_obbs();
+            &raw
+        } else {
+            &self.collision.boxes
+        };
+        boxes
             .iter()
             .enumerate()
             .filter_map(|(index, box_)| {
@@ -1188,46 +1479,72 @@ impl CollisionEditorApp {
                 );
             }
         }
+        if let Some(document) = &self.light_editor.document {
+            document.write(&mut json)?;
+        } else {
+            light::Document::read(&json)?;
+        }
         serde_json::to_vec_pretty(&json).map_err(|e| e.to_string())
     }
 
-    fn export_package(&mut self) {
-        if let Some(target_dir) = rfd::FileDialog::new().pick_folder() {
-            let pkg_dir = target_dir.join(&self.meta.uid);
-            if let Err(e) = fs::create_dir_all(&pkg_dir) {
-                rfd::MessageDialog::new()
-                    .set_title("Ошибка")
-                    .set_description(&format!("Не удалось создать директорию: {}", e))
-                    .show();
-                return;
+    fn write_package(&self, target_dir: &Path) -> Result<PathBuf, String> {
+        if self.meta.uid.is_empty()
+            || self.meta.uid == "."
+            || self.meta.uid == ".."
+            || self.meta.uid.contains(['/', '\\', ':'])
+        {
+            return Err("UID должен быть одним именем папки".into());
+        }
+        if self.obj.is_none() && self.raw_model_json.trim().is_empty() {
+            return Err("Сначала загрузите модель".into());
+        }
+        let collision = collision_asset::Asset::from_editor(&self.meta.uid, &self.collision.boxes)?;
+        let json = if self.obj.is_none() {
+            Some(self.exported_model_json()?)
+        } else {
+            self.obj_transform.validate()?;
+            None
+        };
+        if let Some(mesh) = &self.obj {
+            let (min, max) = mesh.bounds(self.obj_transform);
+            if !min.is_finite() || !max.is_finite() {
+                return Err("OBJ transform overflow".into());
             }
-
-            if self.raw_model_json.trim().is_empty() {
-                self.status_message = "Экспорт отменён: сначала загрузите модель.".to_string();
-                return;
+        }
+        let pkg_dir = target_dir.join(&self.meta.uid);
+        let other_model = if self.obj.is_some() {
+            "model.json"
+        } else {
+            "model.obj"
+        };
+        if pkg_dir.join(other_model).exists() {
+            return Err("В папке уже находится модель другого формата. Выберите новый UID или другую папку.".into());
+        }
+        fs::create_dir_all(&pkg_dir).map_err(|e| e.to_string())?;
+        fs::write(
+            pkg_dir.join("meta.json"),
+            serde_json::to_vec_pretty(&self.meta).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        export_io::write_json_atomic(&pkg_dir.join("collision.json"), &collision)?;
+        if let Some(json) = json {
+            fs::write(pkg_dir.join("model.json"), json).map_err(|e| e.to_string())?;
+        }
+        if let Some(mesh) = &self.obj {
+            let file = fs::File::create(pkg_dir.join("model.obj")).map_err(|e| e.to_string())?;
+            let mut out = std::io::BufWriter::new(file);
+            mesh.write_obj(self.obj_transform, &mut out, self.texture_path.is_some())
+                .map_err(|e| e.to_string())?;
+            std::io::Write::flush(&mut out).map_err(|e| e.to_string())?;
+            if let Some(tex) = &self.texture_path {
+                Self::copy_texture_safely(tex, &pkg_dir.join("texture.png"))?;
+                fs::write(
+                    pkg_dir.join("model.mtl"),
+                    "newmtl preview\nKd 1 1 1\nmap_Kd texture.png\n",
+                )
+                .map_err(|e| e.to_string())?;
             }
-            let model_json = match self.exported_model_json() {
-                Ok(json) => json,
-                Err(error) => {
-                    self.status_message = error;
-                    return;
-                }
-            };
-            if let Err(e) = fs::File::create(pkg_dir.join("meta.json"))
-                .and_then(|file| {
-                    serde_json::to_writer_pretty(file, &self.meta).map_err(std::io::Error::other)
-                })
-                .and_then(|_| {
-                    fs::write(
-                        pkg_dir.join("collision.json"),
-                        serde_json::to_vec_pretty(&self.collision).unwrap(),
-                    )
-                })
-                .and_then(|_| fs::write(pkg_dir.join("model.json"), &model_json))
-            {
-                self.status_message = format!("Ошибка экспорта: {e}");
-                return;
-            }
+        } else {
             if let Some(tex) = &self.texture_path {
                 if self.texture_sources.len() <= 1 {
                     let export_name = self
@@ -1245,8 +1562,7 @@ impl CollisionEditorApp {
                         .map(Self::png_file_name)
                         .unwrap_or_else(|| "texture.png".to_string());
                     if let Err(e) = Self::copy_texture_safely(tex, &pkg_dir.join(export_name)) {
-                        self.status_message = e;
-                        return;
+                        return Err(e);
                     }
                 } else {
                     for (slot, source) in &self.texture_sources {
@@ -1262,19 +1578,21 @@ impl CollisionEditorApp {
                         if let Err(e) =
                             Self::copy_texture_safely(source, &pkg_dir.join(export_name))
                         {
-                            self.status_message = e;
-                            return;
+                            return Err(e);
                         }
                     }
                 }
             }
+        }
+        Ok(pkg_dir)
+    }
 
-            self.status_message = format!("Пакет готов: {}", pkg_dir.display());
-
-            rfd::MessageDialog::new()
-                .set_title("Успех")
-                .set_description(&format!("Пакет сохранён в:\n{:?}", pkg_dir))
-                .show();
+    fn export_package(&mut self) {
+        if let Some(target_dir) = rfd::FileDialog::new().pick_folder() {
+            self.status_message = match self.write_package(&target_dir) {
+                Ok(path) => format!("Пакет готов: {}", path.display()),
+                Err(e) => format!("Ошибка экспорта: {e}"),
+            };
         }
     }
 }
@@ -1284,6 +1602,7 @@ impl CollisionEditorApp {
 // ==========================================
 
 struct Triangle3D {
+    uv: Option<[egui::Pos2; 3]>,
     p0: Vec3,
     p1: Vec3,
     p2: Vec3,
@@ -1292,6 +1611,7 @@ struct Triangle3D {
 }
 
 struct TexturedQuad3D {
+    color: egui::Color32,
     positions: [Vec3; 4],
     uv: [egui::Pos2; 4],
     avg_depth: f32,
@@ -1303,7 +1623,10 @@ impl CollisionEditorApp {
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::drag());
 
         // Камера
-        if response.dragged_by(egui::PointerButton::Primary) && self.gizmo_drag.is_none() {
+        if response.dragged_by(egui::PointerButton::Primary)
+            && self.gizmo_drag.is_none()
+            && !self.light_editor.direction_drag
+        {
             let delta = response.drag_delta();
             self.camera.yaw += delta.x * 0.01_f32;
             self.camera.pitch = (self.camera.pitch - delta.y * 0.01_f32).clamp(-1.55_f32, 1.55_f32);
@@ -1311,6 +1634,7 @@ impl CollisionEditorApp {
         if response.dragged_by(egui::PointerButton::Middle)
             || (response.dragged_by(egui::PointerButton::Primary)
                 && self.gizmo_drag.is_none()
+                && !self.light_editor.direction_drag
                 && ui.input(|i| i.modifiers.shift))
         {
             let delta = response.drag_delta();
@@ -1355,7 +1679,10 @@ impl CollisionEditorApp {
         // The gizmo takes priority over camera rotation and stores one undo point
         // per drag, matching editors users already know.
         let mut gizmo_pressed = false;
-        if let (Some(index), Some(pointer)) = (self.selected_box, response.interact_pointer_pos()) {
+        if let (Some(index), Some(pointer)) = (
+            self.selected_box.filter(|_| !self.light_editor.tab),
+            response.interact_pointer_pos(),
+        ) {
             if let Some(center) = self.collision.boxes.get(index).map(|box_| box_.center_v()) {
                 for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
                     if let (Some((from, _)), Some((to, _))) =
@@ -1388,9 +1715,38 @@ impl CollisionEditorApp {
                     box_.center = (Vec3::from_array(start_center) + axis * world_delta).to_array();
                 }
             }
-        } else if response.clicked_by(egui::PointerButton::Primary) && !gizmo_pressed {
+        } else if response.clicked_by(egui::PointerButton::Primary)
+            && !gizmo_pressed
+            && !self.light_editor.direction_drag
+        {
             if let Some(pointer) = response.interact_pointer_pos() {
-                self.selected_box = self.pick_obb(view_proj, rect, pointer);
+                let picked = self.pick_obb(view_proj, rect, pointer);
+                if self.light_editor.tab {
+                    let editor = &mut self.light_editor;
+                    if !ui.input(|input| {
+                        input.modifiers.shift || input.modifiers.command || input.modifiers.ctrl
+                    }) {
+                        editor.selected_elements.clear();
+                    }
+                    editor.active_element = picked;
+                    editor.selected = picked.and_then(|index| {
+                        editor
+                            .document
+                            .as_ref()?
+                            .entries
+                            .iter()
+                            .position(|entry| entry.element == Some(index))
+                    });
+                    if let Some(index) = picked {
+                        editor.selected_elements.insert(index);
+                        editor.reveal_element = true;
+                        if editor.selected.is_none() {
+                            editor.only_sources = false;
+                        }
+                    }
+                } else {
+                    self.selected_box = picked;
+                }
             }
         }
 
@@ -1422,6 +1778,12 @@ impl CollisionEditorApp {
             }
         }
 
+        let light_raw =
+            serde_json::from_str(&self.raw_model_json).unwrap_or(serde_json::Value::Null);
+        let preview_lights = light::preview_sources(&self.light_editor, &light_raw);
+        if self.light_editor.tab && self.light_editor.environment {
+            light::draw_environment(&painter, &project, &preview_lights, self.light_editor.night);
+        }
         // 2. Model faces. `egui` is a 2D painter, so we explicitly cull back
         // faces and tessellate textured quads for stable perspective UVs.
         let light_dir = Vec3::new(0.5_f32, 0.8_f32, 0.4_f32).normalize();
@@ -1431,7 +1793,8 @@ impl CollisionEditorApp {
                 self.camera.distance * self.camera.pitch.sin(),
                 self.camera.distance * self.camera.yaw.sin() * self.camera.pitch.cos(),
             );
-        let mut triangles: Vec<Triangle3D> = Vec::new();
+        let mut triangles = std::mem::take(&mut self.triangle_buffer);
+        triangles.clear();
         let mut textured_quads: Vec<TexturedQuad3D> = Vec::new();
 
         if self.show_model_faces {
@@ -1475,12 +1838,17 @@ impl CollisionEditorApp {
                             continue;
                         }
                         let dot = norm.dot(light_dir).abs();
-                        let intensity = (0.45_f32 + 0.55_f32 * dot).clamp(0.0_f32, 1.0_f32);
+                        let intensity = if self.light_editor.tab && self.light_editor.night {
+                            0.08
+                        } else {
+                            (0.45_f32 + 0.55_f32 * dot).clamp(0.0_f32, 1.0_f32)
+                        };
+                        let tint = light::shade(face_center, outward, &preview_lights, intensity);
 
                         let face_color = egui::Color32::from_rgb(
-                            (160.0_f32 * intensity) as u8,
-                            (140.0_f32 * intensity) as u8,
-                            (110.0_f32 * intensity) as u8,
+                            (160.0_f32 * tint.x) as u8,
+                            (140.0_f32 * tint.y) as u8,
+                            (110.0_f32 * tint.z) as u8,
                         );
 
                         let d1 = (view * Vec4::new(p0.x, p0.y, p0.z, 1.0_f32)).z;
@@ -1519,7 +1887,22 @@ impl CollisionEditorApp {
                                             })
                                             .sum::<f32>()
                                             * 0.25;
+                                        let light_tint = light::shade(
+                                            positions.iter().sum::<Vec3>() * 0.25,
+                                            outward,
+                                            &preview_lights,
+                                            intensity,
+                                        );
                                         textured_quads.push(TexturedQuad3D {
+                                            color: if self.light_editor.tab {
+                                                egui::Color32::from_rgb(
+                                                    (light_tint.x * 255.) as u8,
+                                                    (light_tint.y * 255.) as u8,
+                                                    (light_tint.z * 255.) as u8,
+                                                )
+                                            } else {
+                                                egui::Color32::WHITE
+                                            },
                                             positions,
                                             uv: cell_uv,
                                             avg_depth,
@@ -1530,6 +1913,7 @@ impl CollisionEditorApp {
                             }
                         }
                         triangles.push(Triangle3D {
+                            uv: None,
                             p0,
                             p1,
                             p2,
@@ -1537,6 +1921,7 @@ impl CollisionEditorApp {
                             avg_depth: (d1 + d2) * 0.5_f32,
                         });
                         triangles.push(Triangle3D {
+                            uv: None,
                             p0,
                             p1: p2,
                             p2: p3,
@@ -1548,23 +1933,93 @@ impl CollisionEditorApp {
             }
         }
 
-        triangles.sort_by(|a, b| {
-            a.avg_depth
-                .partial_cmp(&b.avg_depth)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        for tri in triangles {
-            if let (Some((s0, _)), Some((s1, _)), Some((s2, _))) =
-                (project(tri.p0), project(tri.p1), project(tri.p2))
-            {
-                painter.add(egui::Shape::convex_polygon(
-                    vec![s0, s1, s2],
-                    tri.color,
-                    egui::Stroke::NONE,
-                ));
+        if let Some(mesh) = &self.obj {
+            if self.show_model_faces {
+                triangles.reserve(mesh.triangles.len());
+                for t in &mesh.triangles {
+                    let p = t.map(|c| self.obj_transform.point(mesh.vertices[c.vertex as usize]));
+                    let norm = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
+                    let intensity = 0.45 + 0.55 * norm.dot(light_dir).abs();
+                    let uv = match t.map(|c| c.uv) {
+                        [Some(a), Some(b), Some(c)] => Some([a, b, c].map(|i| {
+                            let uv = mesh.uvs[(i.get() - 1) as usize];
+                            egui::pos2(uv.x, 1. - uv.y)
+                        })),
+                        _ => None,
+                    };
+                    triangles.push(Triangle3D {
+                        p0: p[0],
+                        p1: p[1],
+                        p2: p[2],
+                        uv,
+                        color: egui::Color32::from_gray((intensity * 200.) as u8),
+                        avg_depth: p.iter().map(|p| (view * p.extend(1.)).z).sum::<f32>() / 3.,
+                    });
+                }
             }
         }
+        let depth_order = |a: &Triangle3D, b: &Triangle3D| a.avg_depth.total_cmp(&b.avg_depth);
+        if self.obj.is_some() {
+            triangles.sort_unstable_by(depth_order);
+        } else {
+            triangles.sort_by(depth_order);
+        }
+
+        if self.obj.is_some() {
+            // Batch consecutive faces with the same texture. Preserve painter depth order
+            // without allocating a Shape and two small Vecs for every OBJ triangle.
+            let mut batch: Option<egui::epaint::Mesh> = None;
+            for tri in &triangles {
+                let (Some((s0, _)), Some((s1, _)), Some((s2, _))) =
+                    (project(tri.p0), project(tri.p1), project(tri.p2))
+                else {
+                    continue;
+                };
+                let textured = tri.uv.is_some() && self.preview_texture.is_some();
+                let texture_id = if textured {
+                    self.preview_texture.as_ref().unwrap().id()
+                } else {
+                    egui::TextureId::default()
+                };
+                if batch.as_ref().is_some_and(|m| m.texture_id != texture_id) {
+                    painter.add(egui::Shape::mesh(batch.take().unwrap()));
+                }
+                let mesh =
+                    batch.get_or_insert_with(|| egui::epaint::Mesh::with_texture(texture_id));
+                let base = mesh.vertices.len() as u32;
+                let uv = if textured {
+                    tri.uv.unwrap()
+                } else {
+                    [egui::epaint::WHITE_UV; 3]
+                };
+                mesh.vertices
+                    .extend([s0, s1, s2].into_iter().zip(uv).map(|(pos, uv)| {
+                        egui::epaint::Vertex {
+                            pos,
+                            uv,
+                            color: tri.color,
+                        }
+                    }));
+                mesh.indices.extend_from_slice(&[base, base + 1, base + 2]);
+            }
+            if let Some(mesh) = batch {
+                painter.add(egui::Shape::mesh(mesh));
+            }
+        } else {
+            for tri in &triangles {
+                if let (Some((s0, _)), Some((s1, _)), Some((s2, _))) =
+                    (project(tri.p0), project(tri.p1), project(tri.p2))
+                {
+                    painter.add(egui::Shape::convex_polygon(
+                        vec![s0, s1, s2],
+                        tri.color,
+                        egui::Stroke::NONE,
+                    ));
+                }
+            }
+        }
+
+        self.triangle_buffer = triangles;
 
         // egui meshes retain the face UVs instead of reducing every face to one
         // sampled colour.  This keeps texture atlases aligned with Blockbench UV.
@@ -1586,7 +2041,7 @@ impl CollisionEditorApp {
                         mesh.vertices.push(egui::epaint::Vertex {
                             pos: position,
                             uv,
-                            color: egui::Color32::WHITE,
+                            color: quad.color,
                         });
                     }
                     mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
@@ -1639,6 +2094,36 @@ impl CollisionEditorApp {
             }
         }
 
+        if self.show_model_wire {
+            if let Some(mesh) = &self.obj {
+                let stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(60));
+                for t in &mesh.triangles {
+                    let p = t.map(|c| self.obj_transform.point(mesh.vertices[c.vertex as usize]));
+                    for (a, b) in [(0, 1), (1, 2), (2, 0)] {
+                        if let (Some((a, _)), Some((b, _))) = (project(p[a]), project(p[b])) {
+                            painter.line_segment([a, b], stroke);
+                        }
+                    }
+                }
+            }
+        }
+        if self.light_editor.tab {
+            let before = self.light_editor.document.clone();
+            light::draw_guides(
+                ui,
+                &painter,
+                &project,
+                &mut self.light_editor,
+                &light_raw,
+                self.camera.yaw,
+                self.camera.pitch,
+            );
+            if before != self.light_editor.document {
+                if let Some(before) = before {
+                    self.undo_history.push(UndoAction::Lights(before));
+                }
+            }
+        }
         // 4. Отрисовка OBB коллизий
         if self.show_collision {
             for (idx, b) in self.collision.boxes.iter().enumerate() {
@@ -1649,6 +2134,53 @@ impl CollisionEditorApp {
                     egui::Color32::from_rgb(0, 255, 120)
                 };
 
+                if b.settings.kind == collision_asset::Kind::Capsule {
+                    let r = b.settings.radius;
+                    let h = b.settings.half_segment;
+                    let q = b.rotation_quat();
+                    let center = b.center_v();
+                    let stroke =
+                        egui::Stroke::new(if is_selected { 2.5_f32 } else { 1.5_f32 }, color);
+                    let line = |a: Vec3, b: Vec3| {
+                        if let (Some((a, _)), Some((b, _))) =
+                            (project(center + q * a), project(center + q * b))
+                        {
+                            painter.line_segment([a, b], stroke);
+                        }
+                    };
+                    for i in 0..32 {
+                        let a = i as f32 * std::f32::consts::TAU / 32.;
+                        let b = (i + 1) as f32 * std::f32::consts::TAU / 32.;
+                        for y in [-h, h] {
+                            line(
+                                Vec3::new(r * a.cos(), y, r * a.sin()),
+                                Vec3::new(r * b.cos(), y, r * b.sin()),
+                            );
+                        }
+                    }
+                    for i in 0..16 {
+                        let a = i as f32 * std::f32::consts::PI / 16.;
+                        let b = (i + 1) as f32 * std::f32::consts::PI / 16.;
+                        for sign in [-1., 1.] {
+                            for z_plane in [false, true] {
+                                let point = |angle: f32| {
+                                    let y = sign * (h + r * angle.sin());
+                                    let x = r * angle.cos();
+                                    if z_plane {
+                                        Vec3::new(0., y, x)
+                                    } else {
+                                        Vec3::new(x, y, 0.)
+                                    }
+                                };
+                                line(point(a), point(b));
+                            }
+                        }
+                    }
+                    for (x, z) in [(r, 0.), (-r, 0.), (0., r), (0., -r)] {
+                        line(Vec3::new(x, -h, z), Vec3::new(x, h, z));
+                    }
+                    continue;
+                }
                 let corners = b.get_corners();
                 draw_box_wireframe(
                     &painter,
@@ -1658,7 +2190,7 @@ impl CollisionEditorApp {
             }
         }
 
-        if let Some(index) = self.selected_box {
+        if let Some(index) = self.selected_box.filter(|_| !self.light_editor.tab) {
             if let Some(box_) = self.collision.boxes.get(index) {
                 let center = box_.center_v();
                 for (axis, color, label) in [
@@ -1679,6 +2211,35 @@ impl CollisionEditorApp {
                             egui::Color32::WHITE,
                         );
                     }
+                }
+            }
+        }
+        // Draw selection last so model wire and collision wires cannot obscure it.
+        if self.light_editor.tab {
+            if let Some(model) = &self.model {
+                for (index, element) in model.elements.iter().enumerate() {
+                    let active = self.light_editor.active_element == Some(index);
+                    if !active && !self.light_editor.selected_elements.contains(&index) {
+                        continue;
+                    }
+                    let corners = Self::element_to_obb(element).get_corners();
+                    draw_box_wireframe(
+                        &painter,
+                        &corners,
+                        egui::Stroke::new(5.0_f32, egui::Color32::from_rgb(20, 22, 26)),
+                    );
+                    draw_box_wireframe(
+                        &painter,
+                        &corners,
+                        egui::Stroke::new(
+                            3.0_f32,
+                            if active {
+                                egui::Color32::from_rgb(255, 210, 65)
+                            } else {
+                                egui::Color32::from_rgb(85, 195, 255)
+                            },
+                        ),
+                    );
                 }
             }
         }
@@ -1704,6 +2265,18 @@ impl eframe::App for CollisionEditorApp {
         if ctx.input(|i| (i.modifiers.ctrl || i.modifiers.command) && i.key_pressed(egui::Key::Z)) {
             self.undo_collision_edit();
         }
+        if !self.light_editor.paused && self.light_editor.tab {
+            self.light_editor.time += ctx.input(|i| i.stable_dt).min(0.1);
+            if self
+                .light_editor
+                .play_until
+                .is_some_and(|end| self.light_editor.time >= end)
+            {
+                self.light_editor.time = self.light_editor.play_until.take().unwrap();
+                self.light_editor.paused = true;
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
         // Drag & Drop
         if !ctx.input(|i| i.raw.dropped_files.is_empty()) {
             let dropped = ctx.input(|i| i.raw.dropped_files.clone());
@@ -1719,6 +2292,7 @@ impl eframe::App for CollisionEditorApp {
                             if path.file_stem().and_then(|s| s.to_str()) == Some("collision") {
                                 match parse_collision_data(&content) {
                                     Ok(collision) => {
+                                        self.save_undo_point();
                                         self.collision = collision;
                                         self.selected_box = None;
                                         self.status_message = format!(
@@ -1735,6 +2309,8 @@ impl eframe::App for CollisionEditorApp {
                                 self.load_model_from_string(content, Some(path));
                             }
                         }
+                    } else if ext == "obj" {
+                        self.load_model_path(path);
                     } else if ext == "png" {
                         self.load_texture_from_path(path);
                     }
@@ -1753,7 +2329,7 @@ impl eframe::App for CollisionEditorApp {
                 ui.label(egui::RichText::new("РАБОЧИЙ ПРОЦЕСС").small().weak());
                 ui.separator();
                 let steps = [
-                    ("01", "Модель", self.model.is_some()),
+                    ("01", "Модель", self.model.is_some() || self.obj.is_some()),
                     ("02", "Текстура", self.texture_path.is_some()),
                     ("03", "Коллизии", !self.collision.boxes.is_empty()),
                     ("04", "Экспорт", false),
@@ -1773,7 +2349,7 @@ impl eframe::App for CollisionEditorApp {
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.separator();
                     ui.label(
-                        egui::RichText::new("VBO • OBB collision • v2")
+                        egui::RichText::new("JSON / OBJ • collision asset v1")
                             .small()
                             .weak(),
                     );
@@ -1785,18 +2361,48 @@ impl eframe::App for CollisionEditorApp {
             .default_width(380.0)
             .show(ctx, |ui| {
                 ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.light_editor.tab, false, "Пакет / коллизии");
+                    ui.selectable_value(&mut self.light_editor.tab, true, "Свет");
+                });
+                if self.light_editor.tab {
+                    if ui.button("💾 Экспортировать пакет").clicked() { self.export_package(); }
+                    if ui.button("↶ Отменить (Ctrl+Z)").clicked() { self.undo_collision_edit(); }
+                    let before = self.light_editor.document.clone();
+                    egui::ScrollArea::vertical().id_source("light_inspector").show(ui, |ui| {
+                        self.light_editor.panel(ui, &self.raw_model_json);
+                    });
+                    if before != self.light_editor.document {
+                        if let Some(before) = before { self.undo_history.push(UndoAction::Lights(before)); }
+                    }
+                    return;
+                }
+                if self.obj.is_some() {
+                    ui.group(|ui| {
+                        ui.label("OBJ: Y вверх, 1 единица = 1 блок");
+                        let before=self.obj_transform;
+                        ui.horizontal(|ui| {ui.label("Масштаб");ui.add(egui::DragValue::new(&mut self.obj_transform.scale).speed(0.01).clamp_range(0.000001..=1000000.));});
+                        ui.horizontal(|ui| {ui.label("Origin (исходные единицы)");for a in 0..3 {ui.add(egui::DragValue::new(&mut self.obj_transform.origin[a]).speed(0.01));}});
+                        ui.checkbox(&mut self.obj_transform.flip_z,"Отразить Z (смена handedness)");
+                        ui.label("Изменение transform перемещает и масштабирует коллизии вместе с моделью.");
+                        if self.obj_transform != before {
+                            let after=self.obj_transform;
+                            self.obj_transform=before;
+                            if let Err(e)=self.change_obj_transform(after) {self.status_message=e;}
+
+                        }
+                    });
+                }
                 ui.heading("Пакет");
                 ui.separator();
 
                 ui.horizontal(|ui| {
                     if ui.button("📂 Загрузить модель").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Blockbench Model / JSON", &["json"])
+                            .add_filter("Model JSON / OBJ", &["json", "obj"])
                             .pick_file()
                         {
-                            if let Ok(content) = fs::read_to_string(&path) {
-                                self.load_model_from_string(content, Some(path));
-                            }
+                            self.load_model_path(path);
                         }
                     }
                     if ui.button("🖼 Текстуры").clicked() {
@@ -1809,7 +2415,7 @@ impl eframe::App for CollisionEditorApp {
                     }
                     if ui
                         .button("📥 Коллизия")
-                        .on_hover_text("Загрузить v2 OBB или старый min/max collision.json")
+                        .on_hover_text("Загрузить collision asset v1, v2 OBB или старый min/max")
                         .clicked()
                     {
                         if let Some(path) = rfd::FileDialog::new()
@@ -1821,6 +2427,7 @@ impl eframe::App for CollisionEditorApp {
                                 .and_then(|s| parse_collision_data(&s))
                             {
                                 Ok(collision) => {
+                                    self.save_undo_point();
                                     self.collision = collision;
                                     self.selected_box = None;
                                     self.status_message = format!(
@@ -2011,13 +2618,22 @@ impl eframe::App for CollisionEditorApp {
                 ui.add_space(8.0);
                 ui.separator();
                 ui.heading(format!(
-                    "🛠 Ручная правка OBB ({})",
+                    "🛠 Ручная правка коллизий ({})",
                     self.collision.boxes.len()
                 ));
 
+                ui.horizontal(|ui| {
+                    for (kind,label) in [(collision_asset::Kind::Aabb,"+ AABB"),(collision_asset::Kind::Capsule,"+ Capsule")] {
+                        if ui.button(label).clicked() {self.save_undo_point();self.collision.boxes.push(ObbBox{settings:collision_editor::Settings{kind,..Default::default()},..Default::default()});self.selected_box=Some(self.collision.boxes.len()-1);}
+                    }
+                    if ui.button("NONE").clicked(){self.save_undo_point();self.collision.boxes.clear();self.selected_box=None;}
+                });
+                ui.label("Несколько primitives экспортируются как Compound.");
+                if self.obj.is_some() {ui.label("Автогенерация OBJ создаёт общий AABB; детали задаются вручную.");}
                 if ui.button("➕ Добавить OBB бокс").clicked() {
                     self.save_undo_point();
                     self.collision.boxes.push(ObbBox {
+                settings: Default::default(),
                         center: [0.0_f32, 0.25_f32, 0.0_f32],
                         half_size: [0.25_f32, 0.25_f32, 0.25_f32],
                         rotation: [0.0_f32, 0.0_f32, 0.0_f32],
@@ -2035,7 +2651,7 @@ impl eframe::App for CollisionEditorApp {
                             ui.group(|ui| {
                                 ui.horizontal(|ui| {
                                     if ui
-                                        .selectable_label(is_selected, format!("OBB Box #{}", idx))
+                                        .selectable_label(is_selected, format!("{:?} #{}", b.settings.kind, idx))
                                         .clicked()
                                     {
                                         self.selected_box = Some(idx);
@@ -2045,6 +2661,17 @@ impl eframe::App for CollisionEditorApp {
                                     }
                                 });
 
+                                egui::ComboBox::from_id_source(("primitive",idx)).selected_text(format!("{:?}",b.settings.kind)).show_ui(ui,|ui|{
+                                    ui.selectable_value(&mut b.settings.kind,collision_asset::Kind::Aabb,"AABB");
+                                    ui.selectable_value(&mut b.settings.kind,collision_asset::Kind::Obb,"OBB");
+                                    ui.selectable_value(&mut b.settings.kind,collision_asset::Kind::Capsule,"Capsule");
+                                });
+                                ui.horizontal(|ui| {ui.label("Flags");ui.add(egui::DragValue::new(&mut b.settings.flags));ui.label("Mask");ui.add(egui::DragValue::new(&mut b.settings.mask));});
+                                if b.settings.kind==collision_asset::Kind::Capsule {
+                                    ui.horizontal(|ui| {ui.label("Radius");ui.add(egui::DragValue::new(&mut b.settings.radius).speed(0.005).clamp_range(0.000001..=1000000.));ui.label("Half segment (Y)");ui.add(egui::DragValue::new(&mut b.settings.half_segment).speed(0.005).clamp_range(0.0..=1000000.));});
+                                    b.half_size=[b.settings.radius,b.settings.radius+b.settings.half_segment,b.settings.radius];
+                                }
+                                if b.settings.kind==collision_asset::Kind::Aabb {b.rotation=[0.;3];}
                                 ui.horizontal(|ui| {
                                     ui.label("Center:");
                                     ui.add(
@@ -2064,26 +2691,27 @@ impl eframe::App for CollisionEditorApp {
                                     );
                                 });
 
-                                ui.horizontal(|ui| {
+                                ui.add_enabled_ui(b.settings.kind!=collision_asset::Kind::Capsule,|ui| { ui.horizontal(|ui| {
                                     ui.label("Half size:");
                                     ui.add(
-                                        egui::DragValue::new(&mut b.half_size[0])
+                                        egui::DragValue::new(&mut b.half_size[0]).clamp_range(0.0..=1000000.)
                                             .speed(0.005_f32)
                                             .prefix("X:"),
                                     );
                                     ui.add(
-                                        egui::DragValue::new(&mut b.half_size[1])
+                                        egui::DragValue::new(&mut b.half_size[1]).clamp_range(0.0..=1000000.)
                                             .speed(0.005_f32)
                                             .prefix("Y:"),
                                     );
                                     ui.add(
-                                        egui::DragValue::new(&mut b.half_size[2])
+                                        egui::DragValue::new(&mut b.half_size[2]).clamp_range(0.0..=1000000.)
                                             .speed(0.005_f32)
                                             .prefix("Z:"),
                                     );
                                 });
 
-                                ui.horizontal(|ui| {
+                                });
+                                ui.add_enabled_ui(b.settings.kind!=collision_asset::Kind::Aabb,|ui| { ui.horizontal(|ui| {
                                     ui.label("Rotation:");
                                     ui.add(
                                         egui::DragValue::new(&mut b.rotation[0])
@@ -2101,13 +2729,16 @@ impl eframe::App for CollisionEditorApp {
                                             .prefix("Roll:"),
                                     );
                                 });
+                                });
+                                if b.settings.kind==collision_asset::Kind::Aabb {b.rotation=[0.;3];}
+                                if b.settings.kind==collision_asset::Kind::Capsule {b.half_size=[b.settings.radius,b.settings.radius+b.settings.half_segment,b.settings.radius];}
                             });
                         }
                     });
 
                 if self.collision != collision_before_edit {
                     self.undo_history
-                        .push(UndoAction::Collision(collision_before_edit));
+                        .push(UndoAction::Collision(collision_before_edit, self.obj_transform));
                 }
 
                 if let Some(idx) = to_delete {
@@ -2137,7 +2768,7 @@ impl eframe::App for CollisionEditorApp {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.show_model_faces, "Тело модели");
                 ui.checkbox(&mut self.show_model_wire, "Каркас модели");
-                ui.checkbox(&mut self.show_collision, "Коллизия (OBB)");
+                ui.checkbox(&mut self.show_collision, "Коллизии");
                 ui.checkbox(&mut self.show_grid, "Сетка");
                 ui.separator();
                 ui.label(&self.status_message);
@@ -2180,6 +2811,7 @@ mod tests {
         let data = CollisionData {
             version: 2,
             boxes: vec![ObbBox {
+                settings: Default::default(),
                 center: [0.0, 0.5, 0.0],
                 half_size: [0.5, 0.5, 0.5],
                 rotation: [0.0, 35.0, 0.0],
@@ -2228,6 +2860,7 @@ mod tests {
         app.min_detail_size = 0.1;
         app.approximation_fill = 0.01;
         let box_at = |x, half| ObbBox {
+            settings: Default::default(),
             center: [x, 0.0, 0.0],
             half_size: half,
             rotation: [0.0; 3],
@@ -2272,6 +2905,33 @@ mod tests {
         assert_eq!(value["textures"]["0"], "example:block/child");
         assert_eq!(value["elements"].as_array().unwrap().len(), 1);
         assert_eq!(value["render_type"], "solid");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn namespaced_parent_can_be_loaded_from_imported_model_directory() {
+        let root = std::env::temp_dir().join(format!("swrmc-local-parent-{}", std::process::id()));
+        let model_dir = root.join("models/block");
+        fs::create_dir_all(&model_dir).unwrap();
+        let parent_path = model_dir.join("sun_pi_de_bei_bao_1.json");
+        let child_path = model_dir.join("smersh_backpack.json");
+        fs::write(
+            &parent_path,
+            r#"{"elements":[{"from":[0,0,0],"to":[16,16,16]}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            &child_path,
+            "\u{feff}{\"parent\":\"the_last_day:block/sun_pi_de_bei_bao_1\",\"textures\":{\"all\":\"the_last_day:block/smersh_backpack\"}}",
+        )
+        .unwrap();
+
+        let value = CollisionEditorApp::resolve_inherited_model(&child_path, 0).unwrap();
+        assert_eq!(value["elements"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            value["textures"]["all"],
+            "the_last_day:block/smersh_backpack"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2347,5 +3007,307 @@ mod tests {
         let uv = app.face_uv(&element, "north").unwrap();
         assert!((uv[1].x - 0.5).abs() < 0.0001);
         assert!((uv[2].y - 0.5).abs() < 0.0001);
+    }
+}
+
+#[cfg(test)]
+mod light_integration_tests {
+    use super::*;
+    fn app() -> CollisionEditorApp {
+        let mut app = CollisionEditorApp::default();
+        app.load_model_from_string(r##"{"elements":[{"name":"Lamp","from":[6,12,6],"to":[10,14,10],"faces":{"up":{"texture":"#0"}},"light":{"id":"bulb.main","spot":true}}],"lights":[{"id":"led","position":[4,12,8]}]}"##.into(), None);
+        app.light_editor.tab = true;
+        app.light_editor.selected = Some(0);
+        app
+    }
+    #[test]
+    fn light_undo_preserves_texture_and_export_is_validated() {
+        let mut app = app();
+        app.texture_path = Some(PathBuf::from("keep.png"));
+        let before = app.light_editor.document.clone().unwrap();
+        app.undo_history.push(UndoAction::Lights(before.clone()));
+        app.light_editor.document.as_mut().unwrap().entries[0]
+            .profile
+            .radius = 97.;
+        assert!(app.exported_model_json().unwrap_err().contains("radius"));
+        app.undo_collision_edit();
+        assert_eq!(app.texture_path, Some(PathBuf::from("keep.png")));
+        let exported: serde_json::Value =
+            serde_json::from_slice(&app.exported_model_json().unwrap()).unwrap();
+        assert_eq!(light::Document::read(&exported).unwrap(), before);
+        assert_eq!(exported["elements"][0]["name"], "Lamp");
+    }
+    #[test]
+    fn invalid_import_keeps_current_model_and_lights() {
+        let mut app = app();
+        let before = app.raw_model_json.clone();
+        let lights = app.light_editor.document.clone();
+        app.load_model_from_string(r#"{"elements":[],"lights":[{"id":"bad"}]}"#.into(), None);
+        assert_eq!(app.raw_model_json, before);
+        assert_eq!(app.light_editor.document, lights);
+        assert!(app.status_message.contains("position"));
+    }
+    #[test]
+    fn light_panel_and_preview_render_for_point_and_spot() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        for spot in [true, false] {
+            for size in [egui::vec2(320., 240.), egui::vec2(1200., 800.)] {
+                app.light_editor.document.as_mut().unwrap().entries[0]
+                    .profile
+                    .spot = spot;
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::SidePanel::right("test_light_panel").show(ctx, |ui| {
+                            egui::ScrollArea::vertical()
+                                .show(ui, |ui| app.light_editor.panel(ui, &app.raw_model_json));
+                        });
+                        egui::CentralPanel::default().show(ctx, |ui| app.render_viewport(ui));
+                    },
+                );
+                assert!(!output.shapes.is_empty());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod obj_integration_tests {
+    use super::*;
+    const OBJ: &str = "v 1 0 0\nv 2 0 0\nv 1 1 1\nvt 0 0\nvt 1 0\nvt 0 1\nf 1/1 2/2 3/3\n";
+    fn temp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("swrmc-obj-{name}-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+    #[test]
+    fn obj_folder_export_reimports_geometry_texture_and_collisions() {
+        let dir = temp("package");
+        let source = dir.join("chair.obj");
+        fs::write(&source, OBJ).unwrap();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]))
+            .save(source.with_extension("png"))
+            .unwrap();
+        let mut app = CollisionEditorApp::default();
+        app.load_model_path(source);
+        assert!(app.obj.is_some());
+        assert!(app.model.is_none());
+        app.collision.boxes.push(ObbBox {
+            settings: collision_editor::Settings {
+                kind: collision_asset::Kind::Capsule,
+                flags: 3,
+                mask: 7,
+                ..Default::default()
+            },
+            rotation: [20., 30., 40.],
+            ..Default::default()
+        });
+        let transform = model_import::Transform {
+            scale: 2.,
+            origin: Vec3::X,
+            flip_z: true,
+        };
+        app.change_obj_transform(transform).unwrap();
+        let folder = app.write_package(&dir).unwrap();
+        assert!(folder.join("model.obj").exists());
+        assert!(folder.join("model.mtl").exists());
+        assert!(folder.join("texture.png").exists());
+        assert!(!folder.join("model.json").exists());
+        let restored =
+            model_import::Mesh::parse(&fs::read_to_string(folder.join("model.obj")).unwrap())
+                .unwrap();
+        assert_eq!(
+            app.obj.as_ref().unwrap().bounds(transform),
+            restored.bounds(Default::default())
+        );
+        let bytes = fs::read(folder.join("collision.json")).unwrap();
+        let c = parse_collision_data(std::str::from_utf8(&bytes).unwrap()).unwrap();
+        assert_eq!(c.boxes.len(), 2);
+        assert_eq!(c.boxes[1].settings, app.collision.boxes[1].settings);
+        assert_eq!(c.boxes[1].center, app.collision.boxes[1].center);
+        assert!(
+            (c.boxes[1]
+                .rotation_quat()
+                .dot(app.collision.boxes[1].rotation_quat())
+                .abs()
+                - 1.)
+                .abs()
+                < 1e-5
+        );
+        app.write_package(&dir).unwrap();
+        assert_eq!(bytes, fs::read(folder.join("collision.json")).unwrap());
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            app.sync_preview_texture(ctx);
+            egui::CentralPanel::default().show(ctx, |ui| app.render_viewport(ui));
+        });
+        assert_eq!(app.triangle_buffer.len(), 1);
+        app.undo_collision_edit();
+        assert_eq!(app.obj_transform, model_import::Transform::default());
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn json_package_keeps_source_fields_and_uses_same_collision_contract() {
+        let dir = temp("json");
+        let mut app = CollisionEditorApp::default();
+        app.load_model_from_string(
+            r#"{"custom":"kept","elements":[{"from":[0,0,0],"to":[16,16,16]}]}"#.into(),
+            None,
+        );
+        let folder = app.write_package(&dir).unwrap();
+        let source: serde_json::Value =
+            serde_json::from_slice(&fs::read(folder.join("model.json")).unwrap()).unwrap();
+        assert_eq!(source["custom"], "kept");
+        let contract: collision_asset::Asset =
+            serde_json::from_slice(&fs::read(folder.join("collision.json")).unwrap()).unwrap();
+        assert_eq!(contract.asset, app.meta.uid);
+        assert_eq!(contract.version, 1);
+        assert_eq!(contract.primitives.len(), 1);
+        app.collision.boxes.clear();
+        app.write_package(&dir).unwrap();
+        let contract: collision_asset::Asset =
+            serde_json::from_slice(&fs::read(folder.join("collision.json")).unwrap()).unwrap();
+        assert!(matches!(
+            contract.composition,
+            collision_asset::Composition::None
+        ));
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn invalid_obj_keeps_previous_model_and_dense_mesh_remains_indexed() {
+        let dir = temp("invalid");
+        let source = dir.join("invalid.obj");
+        fs::write(&source, "f 1 2 3").unwrap();
+        let mut app = CollisionEditorApp::default();
+        app.load_model_from_string("{\"elements\":[]}".into(), None);
+        let before = app.raw_model_json.clone();
+        app.load_model_path(source);
+        assert!(app.model.is_some());
+        assert_eq!(app.raw_model_json, before);
+        let mut content = OBJ.to_owned();
+        for _ in 0..10000 {
+            content.push_str("f 1/1 2/2 3/3\n");
+        }
+        let mesh = model_import::Mesh::parse(&content).unwrap();
+        assert_eq!(mesh.vertices.len(), 3);
+        assert_eq!(mesh.triangles.len(), 10001);
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod optimization_audit {
+    use super::*;
+
+    #[test]
+    fn contract_validation_rejects_overflow_and_preserves_bits() {
+        use collision_asset::{Asset, Kind, Primitive};
+        let mut a = Asset::from_editor("audit", &[ObbBox::default()]).unwrap();
+        a.primitives[0] = Primitive::Aabb {
+            center: [f32::MAX; 3],
+            half_extents: [f32::MAX; 3],
+            flags: 0,
+            mask: u32::MAX,
+        };
+        assert!(a.validate().is_err());
+        a.primitives[0] = Primitive::Capsule {
+            center: [0.; 3],
+            orientation: [0., 0., 0., 1.],
+            radius: f32::MAX,
+            half_segment: f32::MAX,
+            flags: 0,
+            mask: 0,
+        };
+        assert!(a.validate().is_err());
+        for q in [[0.; 4], [f32::MAX; 4], [f32::NAN, 0., 0., 1.]] {
+            assert!(collision_asset::checked_orientation(q).is_err());
+        }
+        let b = ObbBox {
+            rotation: [0., 270., 0.],
+            settings: collision_editor::Settings {
+                kind: Kind::Capsule,
+                half_segment: 0.,
+                flags: u32::MAX,
+                mask: 0x80000000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let a = Asset::from_editor("audit", &[b]).unwrap();
+        let bytes = serde_json::to_vec(&a).unwrap();
+        let restored = parse_collision_data(std::str::from_utf8(&bytes).unwrap()).unwrap();
+        assert_eq!(restored.boxes[0].settings.flags, u32::MAX);
+        assert_eq!(restored.boxes[0].settings.mask, 0x80000000);
+        if let Primitive::Capsule { orientation, .. } = &a.primitives[0] {
+            assert!(orientation[3] >= 0.);
+        }
+        assert!(parse_collision_data("{}").is_err());
+        a.validate().unwrap();
+    }
+
+    #[test]
+    fn compact_obj_indices_preserve_uv_and_missing_uv() {
+        assert_eq!(std::mem::size_of::<model_import::Corner>(), 8);
+        assert_eq!(std::mem::size_of::<[model_import::Corner; 3]>(), 24);
+        let mesh = model_import::Mesh::parse(
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0.25 0.75\nf 1/1 2/1 3/1\nf 1 2 3\n",
+        )
+        .unwrap();
+        assert_eq!(mesh.triangles[0][0].uv.unwrap().get(), 1);
+        assert!(mesh.triangles[1][0].uv.is_none());
+        let mut out = Vec::new();
+        mesh.write_obj(Default::default(), &mut out, false).unwrap();
+        let text = std::str::from_utf8(&out).unwrap();
+        assert!(text.contains("f 1/1 2/1 3/1\nf 1 2 3"));
+        let restored = model_import::Mesh::parse(text).unwrap();
+        assert_eq!(restored.uvs, mesh.uvs);
+    }
+
+    #[test]
+    fn failed_transform_leaves_editor_unchanged() {
+        let mut app = CollisionEditorApp::default();
+        app.collision.boxes.push(ObbBox {
+            center: [f32::MAX / 4., 0., 0.],
+            ..Default::default()
+        });
+        let before = app.collision.clone();
+        let target = app.camera.target;
+        let result = app.change_obj_transform(model_import::Transform {
+            scale: 16.,
+            ..Default::default()
+        });
+        assert!(result.is_err());
+        assert_eq!(app.collision, before);
+        assert_eq!(app.obj_transform, model_import::Transform::default());
+        assert_eq!(app.camera.target, target);
+        assert!(app.undo_history.pop().is_none());
+    }
+
+    #[test]
+    fn streamed_export_failure_preserves_previous_file() {
+        struct Failing;
+        impl Serialize for Failing {
+            fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("simulated write failure"))
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("swrmc-atomic-audit-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("collision.json");
+        fs::write(&path, b"previous").unwrap();
+        assert!(export_io::write_json_atomic(&path, &Failing).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"previous");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        let asset = collision_asset::Asset::from_editor("audit", &[]).unwrap();
+        export_io::write_json_atomic(&path, &asset).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            serde_json::to_vec(&asset).unwrap()
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 }

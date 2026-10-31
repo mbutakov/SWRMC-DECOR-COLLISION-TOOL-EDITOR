@@ -33,6 +33,11 @@ impl Camera {
     }
 
     pub fn proj_matrix(&self, aspect: f32) -> Mat4 {
-        Mat4::perspective_rh(45.0_f32.to_radians(), aspect, 0.1, 100.0)
+        Mat4::perspective_rh(
+            45.0_f32.to_radians(),
+            aspect,
+            0.1,
+            (self.distance * 10.0).max(100.0),
+        )
     }
 }
